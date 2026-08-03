@@ -976,7 +976,6 @@ class Qwen3_5MoeMLA(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
         self.num_heads = config.num_attention_heads
@@ -988,6 +987,7 @@ class Qwen3_5MoeMLA(nn.Module):
         self.v_head_dim = config.mla_args["v_head_dim"]
         self.qk_nope_head_dim = config.mla_args["qk_nope_head_dim"]
         self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.scaling = self.q_head_dim**-0.5
 
         self.q_a_proj = nn.Linear(
             config.hidden_size, self.q_lora_rank, bias=config.attention_bias

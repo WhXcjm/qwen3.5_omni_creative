@@ -6,6 +6,7 @@ from typing import Tuple, Dict
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.optim.adamw import adamw as adamw_functional
 
 
 def zeropower_via_newtonschulz5(G, steps):
@@ -100,7 +101,11 @@ class Muon(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
 
     @torch.no_grad()
-    def step(self):
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
 
         # First pass: update muon momentum buffers
         for group in self.param_groups:
@@ -185,38 +190,67 @@ class Muon(torch.optim.Optimizer):
             if group.get('use_muon', False):
                 continue
 
-            # init step
-            if 'step' in group:
-                group['step'] += 1
-            else:
-                group['step'] = 1
-
-            step = group['step']
-            lr = group['lr']
-            weight_decay = group['weight_decay']
             beta1, beta2 = group['adamw_betas']
-            eps = group['adamw_eps']
+            params_with_grad = []
+            grads = []
+            exp_avgs = []
+            exp_avg_sqs = []
+            state_steps = []
+            has_complex = False
 
             for p in group["params"]:
                 if p.grad is None:
                     continue
 
-                g = p.grad
+                if p.grad.is_sparse:
+                    raise RuntimeError(
+                        "AdamW does not support sparse gradients, please consider SparseAdam instead"
+                    )
+
+                has_complex |= torch.is_complex(p)
+                params_with_grad.append(p)
+                grads.append(p.grad)
                 state = self.state[p]
 
-                if len(state) == 0:
-                    state['adamw_exp_avg'] = torch.zeros_like(g)
-                    state['adamw_exp_avg_sq'] = torch.zeros_like(g)
+                if "step" not in state:
+                    state["step"] = torch.tensor(
+                        0.0, dtype=torch.float32, device="cpu"
+                    )
+                if "exp_avg" not in state:
+                    state["exp_avg"] = torch.zeros_like(
+                        p, memory_format=torch.preserve_format
+                    )
+                if "exp_avg_sq" not in state:
+                    state["exp_avg_sq"] = torch.zeros_like(
+                        p, memory_format=torch.preserve_format
+                    )
 
-                buf1 = state['adamw_exp_avg']
-                buf2 = state['adamw_exp_avg_sq']
-                buf1.lerp_(g, 1 - beta1)
-                buf2.lerp_(g.square(), 1 - beta2)
+                exp_avgs.append(state["exp_avg"])
+                exp_avg_sqs.append(state["exp_avg_sq"])
+                state_steps.append(state["step"])
 
-                g = buf1 / (eps + buf2.sqrt())
+            if params_with_grad:
+                adamw_functional(
+                    params_with_grad,
+                    grads,
+                    exp_avgs,
+                    exp_avg_sqs,
+                    [],
+                    state_steps,
+                    foreach=False,
+                    capturable=False,
+                    differentiable=False,
+                    fused=False,
+                    grad_scale=None,
+                    found_inf=None,
+                    has_complex=has_complex,
+                    amsgrad=False,
+                    beta1=beta1,
+                    beta2=beta2,
+                    lr=group['lr'],
+                    weight_decay=group['weight_decay'],
+                    eps=group['adamw_eps'],
+                    maximize=False,
+                )
 
-                bias_correction1 = 1 - beta1**step
-                bias_correction2 = 1 - beta2**step
-                scale = bias_correction1 / bias_correction2**0.5
-                p.data.mul_(1 - lr * weight_decay)
-                p.data.add_(g, alpha=- lr / scale)
+        return loss

@@ -38,6 +38,15 @@ from ...optimizer.muon import Muon
 logger = logging.getLogger(__name__)
 
 
+MUON_FALLBACK_NAME_RULES: List[Tuple[str, str]] = [
+    ("suffix", ".bias"),
+    ("contains", "embedding"),
+    ("contains", "output_layer"),
+    ("suffix", "embed_tokens.weight"),
+    ("suffix", "lm_head.weight"),
+]
+
+
 class MultiOptimizer(Optimizer, Stateful):
     """
     A container that handles multiple optimizers (for ep and non-ep parameters when ep+fsdp2 is enabled)
@@ -152,21 +161,25 @@ def _make_param_groups_for_subset(
     return groups
 
 
+def _matches_muon_fallback_name(name: str) -> bool:
+    for match_type, pattern in MUON_FALLBACK_NAME_RULES:
+        if match_type == "suffix" and name.endswith(pattern):
+            return True
+        if match_type == "contains" and pattern in name:
+            return True
+    return False
+
+
 # Check if a parameter is eligible for Muon optimization.
 def _is_muon_eligible(name: str, param: torch.nn.Parameter) -> bool:
-    is_2d_matrix = len(param.shape) == 2
-    return (
-        not name.endswith(".bias")
-        and "embedding" not in name
-        and "output_layer" not in name
-        and is_2d_matrix
-    )
+    return len(param.shape) == 2 and not _matches_muon_fallback_name(name)
 
 
 def _mark_muon_param_groups(
     model: "nn.Module",
     param_groups: Sequence[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
+    # TODO(F2): Reuse this partition point for qkvgate_split metadata; do not duplicate parameter routing.
     name_by_param = {p: n for n, p in model.named_parameters()}
     marked_groups: List[Dict[str, Any]] = []
 
