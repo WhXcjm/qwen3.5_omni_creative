@@ -175,12 +175,59 @@ def _is_muon_eligible(name: str, param: torch.nn.Parameter) -> bool:
     return len(param.shape) == 2 and not _matches_muon_fallback_name(name)
 
 
+def _collect_muon_split_specs(
+    model: "nn.Module",
+) -> Dict[torch.nn.Parameter, Dict[str, Any]]:
+    split_specs: Dict[torch.nn.Parameter, Dict[str, Any]] = {}
+
+    for module_name, module in model.named_modules():
+        layout_specs = getattr(module, "_muon_layout_specs", None)
+        if layout_specs is None:
+            continue
+        if not isinstance(layout_specs, dict):
+            raise TypeError(
+                f"{module_name or '<root>'}._muon_layout_specs must be a dict"
+            )
+
+        for local_param_name, split_spec in layout_specs.items():
+            qualified_name = (
+                f"{module_name}.{local_param_name}"
+                if module_name
+                else local_param_name
+            )
+            if not isinstance(local_param_name, str) or not isinstance(split_spec, dict):
+                raise TypeError(
+                    f"Muon layout entry {qualified_name} must map a parameter name to a dict"
+                )
+            try:
+                param = module.get_parameter(local_param_name)
+            except (AttributeError, ValueError) as exc:
+                raise ValueError(
+                    f"Muon layout entry {qualified_name} does not resolve to a parameter"
+                ) from exc
+
+            if param in split_specs:
+                raise ValueError(
+                    f"Muon split metadata was declared more than once for {qualified_name}"
+                )
+            expected_shape = tuple(split_spec.get("expected_shape", ()))
+            if tuple(param.shape) != expected_shape:
+                raise ValueError(
+                    f"Muon layout shape mismatch for {qualified_name}: "
+                    f"expected {expected_shape}, got {tuple(param.shape)}"
+                )
+            split_specs[param] = split_spec
+
+    return split_specs
+
+
 def _mark_muon_param_groups(
     model: "nn.Module",
     param_groups: Sequence[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    # TODO(F2): Reuse this partition point for qkvgate_split metadata; do not duplicate parameter routing.
+) -> Tuple[List[Dict[str, Any]], Dict[torch.nn.Parameter, Dict[str, Any]]]:
     name_by_param = {p: n for n, p in model.named_parameters()}
+    declared_split_specs = _collect_muon_split_specs(model)
+    selected_split_specs: Dict[torch.nn.Parameter, Dict[str, Any]] = {}
     marked_groups: List[Dict[str, Any]] = []
 
     for group in param_groups:
@@ -192,8 +239,15 @@ def _mark_muon_param_groups(
             if not p.requires_grad:
                 continue
             param_name = name_by_param.get(p, "")
-            if _is_muon_eligible(param_name, p):
+            split_spec = declared_split_specs.get(p)
+            is_declared_expert = (
+                split_spec is not None
+                and split_spec.get("layout") == "expert_batched_parts"
+            )
+            if _is_muon_eligible(param_name, p) or is_declared_expert:
                 muon_params.append(p)
+                if split_spec is not None:
+                    selected_split_specs[p] = split_spec
             else:
                 fallback_params.append(p)
 
@@ -203,7 +257,7 @@ def _mark_muon_param_groups(
         if fallback_params:
             marked_groups.append({**group_base, "params": fallback_params, "use_muon": False})
 
-    return marked_groups
+    return marked_groups, selected_split_specs
 
 
 # adapted from https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer_pt_utils.py#L1123
@@ -419,7 +473,7 @@ def build_optimizer(
             param_groups.append({"params": no_decay_parameters, "weight_decay": 0.0})
 
     if optimizer_type == "muon":
-        param_groups = _mark_muon_param_groups(model, param_groups)
+        param_groups, split_specs = _mark_muon_param_groups(model, param_groups)
         logger.info(f"Muon parameter groups: {param_groups}")
         optim = Muon(
             param_groups,
@@ -431,6 +485,7 @@ def build_optimizer(
             adamw_betas=betas,
             adamw_eps=eps,
         )
+        optim._set_muon_split_specs(split_specs)
     elif optimizer_type == "adamw":
         foreach = not fused
         fused = fused
@@ -544,8 +599,8 @@ def build_ep_fsdp2_optimizer(
         foreach = not fused
         fused_ = fused
         if optimizer_type == "muon":
-            groups = _mark_muon_param_groups(model, groups)
-            return Muon(
+            groups, split_specs = _mark_muon_param_groups(model, groups)
+            optim = Muon(
                 groups,
                 lr=lr,
                 weight_decay=weight_decay,
@@ -555,6 +610,8 @@ def build_ep_fsdp2_optimizer(
                 adamw_betas=betas,
                 adamw_eps=eps,
             )
+            optim._set_muon_split_specs(split_specs)
+            return optim
         elif optimizer_type == "adamw":
             return AdamW(groups, lr, betas, eps, weight_decay, fused=fused_, foreach=foreach)
         else:

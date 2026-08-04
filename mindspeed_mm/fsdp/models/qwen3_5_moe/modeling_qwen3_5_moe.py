@@ -597,6 +597,18 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
+        self._muon_layout_specs = {
+            "in_proj_qkv.weight": {
+                "layout": "contiguous_head_parts",
+                "expected_shape": (self.key_dim * 2 + self.value_dim, self.hidden_size),
+                "parts": (
+                    ("q", self.num_k_heads, self.head_k_dim),
+                    ("k", self.num_k_heads, self.head_k_dim),
+                    ("value", self.num_v_heads, self.head_v_dim),
+                ),
+            }
+        }
+
     def _get_local_conv1d_weight(self, ulysses_rank: int, local_key_dim: int, local_value_dim: int) -> torch.Tensor:
         # Modification: shard depthwise conv1d weights to match head-sharded mixed_qkv channels.
         w_full = self.conv1d.weight
@@ -1011,6 +1023,41 @@ class Qwen3_5MoeMLA(nn.Module):
             self.num_heads * self.v_head_dim, config.hidden_size, bias=config.attention_bias,
         )
 
+        self._muon_layout_specs = {
+            "q_b_proj.weight": {
+                "layout": "periodic_head_parts",
+                "expected_shape": (self.num_heads * self.q_head_dim, self.q_lora_rank),
+                "head_count": self.num_heads,
+                "parts": (
+                    ("q_nope", self.qk_nope_head_dim),
+                    ("q_rope", self.qk_rope_head_dim),
+                ),
+            },
+            "kv_a_proj_with_mqa.weight": {
+                "layout": "contiguous_parts",
+                "expected_shape": (
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    config.hidden_size,
+                ),
+                "parts": (
+                    ("compressed_kv", self.kv_lora_rank),
+                    ("k_rope", self.qk_rope_head_dim),
+                ),
+            },
+            "kv_b_proj.weight": {
+                "layout": "periodic_head_parts",
+                "expected_shape": (
+                    self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                    self.kv_lora_rank,
+                ),
+                "head_count": self.num_heads,
+                "parts": (
+                    ("k_nope", self.qk_nope_head_dim),
+                    ("value", self.v_head_dim),
+                ),
+            },
+        }
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1242,6 +1289,29 @@ class Qwen3_5LatentMoeExperts(Qwen3_5MoeExperts):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim))
         self.act_fn = ACT2FN[config.hidden_act]
         self.use_grouped_expert_matmul = config.use_grouped_expert_matmul
+        self._muon_layout_specs = {
+            "gate_up_proj": {
+                "layout": "expert_batched_parts",
+                "expected_shape": (
+                    self.num_experts,
+                    self.hidden_dim,
+                    2 * self.intermediate_dim,
+                ),
+                "parts": (
+                    ("gate", self.intermediate_dim),
+                    ("up", self.intermediate_dim),
+                ),
+            },
+            "down_proj": {
+                "layout": "expert_batched_parts",
+                "expected_shape": (
+                    self.num_experts,
+                    self.intermediate_dim,
+                    self.hidden_dim,
+                ),
+                "parts": (("down", self.hidden_dim),),
+            },
+        }
         if self.use_grouped_expert_matmul and IS_NPU_AVAILABLE:
             print_rank(logger.info, "Qwen3_5MoeExperts use NPU fused ops")
 
