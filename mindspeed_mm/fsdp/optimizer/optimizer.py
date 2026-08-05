@@ -434,6 +434,7 @@ def build_optimizer(
     muon_momentum: float = 0.95,
     ns_steps: int = 5,
     muon_head_group_size: int = 1,
+    dynamic_matched_adamw_rms: bool = False,
 ) -> "torch.optim.Optimizer":
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
     ps = get_parallel_state()
@@ -451,6 +452,7 @@ def build_optimizer(
             no_decay_modules,
             no_decay_params,
             matched_adamw_rms=matched_adamw_rms,
+            dynamic_matched_adamw_rms=dynamic_matched_adamw_rms,
             muon_momentum=muon_momentum,
             ns_steps=ns_steps,
             muon_head_group_size=muon_head_group_size,
@@ -482,6 +484,7 @@ def build_optimizer(
             lr=lr,
             weight_decay=weight_decay,
             matched_adamw_rms=matched_adamw_rms,
+            dynamic_matched_adamw_rms=dynamic_matched_adamw_rms,
             momentum=muon_momentum,
             ns_steps=ns_steps,
             adamw_betas=betas,
@@ -514,6 +517,7 @@ def build_ep_fsdp2_optimizer(
     muon_momentum: float = 0.95,
     ns_steps: int = 5,
     muon_head_group_size: int = 1,
+    dynamic_matched_adamw_rms: bool = False,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with EP+FSDP2
@@ -609,6 +613,7 @@ def build_ep_fsdp2_optimizer(
                 lr=lr,
                 weight_decay=weight_decay,
                 matched_adamw_rms=matched_adamw_rms,
+                dynamic_matched_adamw_rms=dynamic_matched_adamw_rms,
                 momentum=muon_momentum,
                 ns_steps=ns_steps,
                 adamw_betas=betas,

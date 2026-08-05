@@ -166,6 +166,15 @@ class TrainingArguments(BaseArguments):
             )
         },
     )
+    dynamic_matched_adamw_rms: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use the AdamW beta1 moment model to set Muon's matched update RMS "
+                "at each optimizer step; ignores matched_adamw_rms when enabled."
+            )
+        },
+    )
     muon_momentum: float = field(
         default=0.95,
         metadata={"help": "Momentum coefficient for Muon internal SGD."},

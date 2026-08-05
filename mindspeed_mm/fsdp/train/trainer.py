@@ -295,6 +295,7 @@ class Trainer:
             no_decay_modules=args.training.no_decay_modules,
             no_decay_params=args.training.no_decay_params,
             matched_adamw_rms=args.training.matched_adamw_rms,
+            dynamic_matched_adamw_rms=args.training.dynamic_matched_adamw_rms,
             muon_momentum=args.training.muon_momentum,
             ns_steps=args.training.ns_steps,
             muon_head_group_size=args.training.muon_head_group_size,
