@@ -156,5 +156,6 @@ mindspeed
 # test
 /tests/st/run_jsons/
 /tests/st/run_logs/
+/diagnostics/_generated/
 
 fusion_result.json
