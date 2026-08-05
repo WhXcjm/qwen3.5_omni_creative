@@ -204,6 +204,7 @@ def test_muon_split_specs_are_copied_and_not_serialized():
     optimizer._set_muon_split_specs(split_specs)
     split_specs.clear()
 
+    assert optimizer._muon_head_group_size == 1
     assert optimizer._muon_split_spec_by_param == {param: split_spec}
     state_dict = optimizer.state_dict()
     assert all(
@@ -278,6 +279,83 @@ def test_periodic_head_parts_match_independent_per_head_part_reference():
     )
 
 
+def _grouped_head_reference(matrix, split_spec, head_group_size):
+    layout = split_spec["layout"]
+    if layout == "contiguous_head_parts":
+        updates, offset = [], 0
+        for _, head_count, head_dim in split_spec["parts"]:
+            group_size = head_count if head_group_size == 0 else head_group_size
+            row_count = head_count * head_dim
+            part = matrix[offset: offset + row_count]
+            updates.extend(
+                _scaled_reference(group, 2, 0.2)
+                for group in torch.split(part, group_size * head_dim, dim=0)
+            )
+            offset += row_count
+        return torch.cat(updates, dim=0)
+
+    head_count = split_spec["head_count"]
+    group_size = head_count if head_group_size == 0 else head_group_size
+    head_major = matrix.reshape(head_count, -1, matrix.shape[1])
+    updates, offset = [], 0
+    for _, part_dim in split_spec["parts"]:
+        part = head_major[:, offset: offset + part_dim]
+        groups = part.reshape(head_count // group_size, group_size * part_dim, -1)
+        update = torch.stack([_scaled_reference(group, 2, 0.2) for group in groups])
+        updates.append(update.reshape(head_count, part_dim, -1))
+        offset += part_dim
+    return torch.cat(updates, dim=1).reshape_as(matrix)
+
+
+@pytest.mark.parametrize("head_group_size", [1, 2, 4, 0])
+def test_head_layouts_apply_ns_per_consecutive_semantic_group(head_group_size):
+    torch.manual_seed(11)
+    cases = (
+        (
+            torch.randn(24, 5, dtype=torch.float64),
+            {
+                "layout": "contiguous_head_parts",
+                "expected_shape": (24, 5),
+                "parts": (("q", 4, 2), ("k", 4, 1), ("value", 4, 3)),
+            },
+        ),
+        (
+            torch.randn(16, 5, dtype=torch.float64),
+            {
+                "layout": "periodic_head_parts",
+                "expected_shape": (16, 5),
+                "head_count": 4,
+                "parts": (("nope", 3), ("rope", 1)),
+            },
+        ),
+    )
+    for matrix, split_spec in cases:
+        actual = _zeropower_via_newtonschulz5_split(
+            matrix, split_spec, 2, 0.2, head_group_size=head_group_size
+        )
+        expected = _grouped_head_reference(matrix, split_spec, head_group_size)
+        torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+        if head_group_size == 0:
+            explicit_all = _zeropower_via_newtonschulz5_split(
+                matrix, split_spec, 2, 0.2, head_group_size=4
+            )
+            torch.testing.assert_close(actual, explicit_all, rtol=0.0, atol=0.0)
+
+
+def test_head_group_size_must_divide_head_count():
+    matrix = torch.randn(16, 5)
+    split_spec = {
+        "layout": "periodic_head_parts",
+        "expected_shape": (16, 5),
+        "head_count": 4,
+        "parts": (("nope", 3), ("rope", 1)),
+    }
+    with pytest.raises(ValueError, match="muon_head_group_size=3.*head_count=4"):
+        _zeropower_via_newtonschulz5_split(
+            matrix, split_spec, 2, 0.2, head_group_size=3
+        )
+
+
 def test_contiguous_parts_match_independent_semantic_reference():
     torch.manual_seed(3)
     matrix = torch.randn(5, 4, dtype=torch.float64)
@@ -301,6 +379,11 @@ def test_contiguous_parts_match_independent_semantic_reference():
     )
 
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    for head_group_size in (2, 4, 0):
+        unchanged = _zeropower_via_newtonschulz5_split(
+            matrix, split_spec, steps, matched_adamw_rms, head_group_size
+        )
+        torch.testing.assert_close(unchanged, actual, rtol=0.0, atol=0.0)
 
 
 def test_expert_batched_parts_match_independent_per_expert_reference():
@@ -326,6 +409,66 @@ def test_expert_batched_parts_match_independent_per_expert_reference():
             )
 
     torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    for head_group_size in (2, 4, 0):
+        unchanged = _zeropower_via_newtonschulz5_split(
+            matrix, split_spec, steps, matched_adamw_rms, head_group_size
+        )
+        torch.testing.assert_close(unchanged, actual, rtol=0.0, atol=0.0)
+
+
+def test_build_optimizer_uses_runtime_policy_without_state_dict_pollution():
+    optimizer_module = _load_optimizer_module()
+    optimizer_module.get_parallel_state = lambda: types.SimpleNamespace(
+        get_ep_group_size=lambda: 1
+    )
+
+    class LayoutModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fused = torch.nn.Linear(5, 16, bias=False)
+            self._muon_layout_specs = {
+                "fused.weight": {
+                    "layout": "periodic_head_parts",
+                    "expected_shape": (16, 5),
+                    "head_count": 4,
+                    "parts": (("nope", 3), ("rope", 1)),
+                }
+            }
+
+    torch.manual_seed(14)
+    model = LayoutModel()
+    param = model.fused.weight
+    initial = param.detach().clone()
+    grad = torch.randn_like(param)
+    lr = 0.05
+    optimizer = optimizer_module.build_optimizer(
+        model,
+        lr=lr,
+        weight_decay=0.0,
+        optimizer_type="muon",
+        fused=False,
+        matched_adamw_rms=0.2,
+        muon_momentum=0.0,
+        ns_steps=2,
+        muon_head_group_size=2,
+    )
+    expected_update = _zeropower_via_newtonschulz5_split(
+        grad.to(torch.bfloat16),
+        model._muon_layout_specs["fused.weight"],
+        2,
+        0.2,
+        head_group_size=2,
+    )
+    param.grad = grad
+    optimizer.step()
+
+    assert optimizer._muon_head_group_size == 2
+    torch.testing.assert_close(param, initial.add(expected_update, alpha=-lr))
+    assert all("muon_head_group_size" not in group for group in optimizer.param_groups)
+    assert all(
+        "muon_head_group_size" not in group
+        for group in optimizer.state_dict()["param_groups"]
+    )
 
 
 def test_muon_without_split_spec_preserves_whole_matrix_update():

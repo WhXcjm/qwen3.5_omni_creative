@@ -78,6 +78,15 @@ def _valid_muon_parts(parts, arity):
     )
 
 
+def _resolve_muon_head_group_size(head_group_size, head_count):
+    group_size = head_count if head_group_size == 0 else head_group_size
+    if group_size <= 0 or head_count % group_size != 0:
+        raise ValueError(
+            f"muon_head_group_size={head_group_size} must be positive and divide head_count={head_count}"
+        )
+    return group_size
+
+
 def _validate_muon_split_spec(param, split_spec):
     if not isinstance(split_spec, dict):
         raise TypeError("Muon split metadata must be a dict")
@@ -93,7 +102,7 @@ def _validate_muon_split_spec(param, split_spec):
     if layout == "contiguous_head_parts":
         # Contiguous by semantic type, e.g. GatedDeltaNet in_proj_qkv:
         #   [Q_head0 | ... | Q_headN | K_head0 | ... | K_headN | V_head0 | ... | V_headM]
-        # parts: ((name, head_count, head_dim), ...).  Each [head_dim, input_dim] NS independently.
+        # parts: ((name, head_count, head_dim), ...).
         if len(expected_shape) != 2 or not _valid_muon_parts(parts, 3):
             raise ValueError("Invalid contiguous_head_parts metadata")
         split_size = sum(head_count * head_dim for _, head_count, head_dim in parts)
@@ -101,7 +110,7 @@ def _validate_muon_split_spec(param, split_spec):
     elif layout == "periodic_head_parts":
         # Head-interleaved layout, e.g. MLA q_b_proj / kv_b_proj:
         #   [head0·nope, head0·rope, head1·nope, head1·rope, ..., headN·nope, headN·rope]
-        # Requires explicit head_count.  parts: ((name, part_dim), ...).  Per-head per-part NS.
+        # Requires explicit head_count.  parts: ((name, part_dim), ...).
         head_count = split_spec.get("head_count")
         if (
             len(expected_shape) != 2
@@ -149,7 +158,13 @@ def _scaled_batched_zeropower(matrices, steps, matched_adamw_rms):
     return update * scale
 
 
-def _zeropower_via_newtonschulz5_split(G, split_spec, steps, matched_adamw_rms):
+def _zeropower_via_newtonschulz5_split(
+    G,
+    split_spec,
+    steps,
+    matched_adamw_rms,
+    head_group_size=1,
+):
     """Split a fused update into semantic matrices, orthogonalize, and regroup."""
     layout = split_spec["layout"]
     expected_shape = tuple(split_spec["expected_shape"])
@@ -165,13 +180,12 @@ def _zeropower_via_newtonschulz5_split(G, split_spec, steps, matched_adamw_rms):
             f"Gathered Muon update shape {tuple(G.shape)} does not match {expected_shape}"
         )
 
-    # TODO: Support configurable heads-per-NS-group (for example, 2, 4, or all heads).
-    # The current policy treats each attention head as an independent NS unit.
+    # Future feature: support non-uniform head groups.
     if layout == "contiguous_head_parts":
         # Contiguous by semantic type, e.g. GatedDeltaNet in_proj_qkv:
         #   G = [Q_head0 | ... | Q_headN | K_head0 | ... | K_headN | V_head0 | ... | V_headM]
         #   Step 1: narrow each part's row range → reshape to [head_count, head_dim, input_dim]
-        #   Step 2: batched NS per head_part [head_dim, input_dim] → reshape back to 2D
+        #   Step 2: regroup consecutive heads -> batched NS per head group -> reshape back to 2D
         #   Step 3: concat along dim=0, restoring the original row order
         input_dim = G.shape[1]
         offset = 0
@@ -181,10 +195,16 @@ def _zeropower_via_newtonschulz5_split(G, split_spec, steps, matched_adamw_rms):
             head_batch = G.narrow(0, offset, row_count).reshape(
                 head_count, head_dim, input_dim
             )
-            head_update = _scaled_batched_zeropower(
-                head_batch, steps, matched_adamw_rms
+            group_size = _resolve_muon_head_group_size(head_group_size, head_count)
+            group_batch = head_batch.reshape(
+                head_count // group_size,
+                group_size * head_dim,
+                input_dim,
             )
-            updates.append(head_update.reshape(row_count, input_dim))
+            group_update = _scaled_batched_zeropower(
+                group_batch, steps, matched_adamw_rms
+            )
+            updates.append(group_update.reshape(row_count, input_dim))
             offset += row_count
         return torch.cat(updates, dim=0)
 
@@ -193,19 +213,25 @@ def _zeropower_via_newtonschulz5_split(G, split_spec, steps, matched_adamw_rms):
         #   G = [h0_nope, h0_rope, h1_nope, h1_rope, ..., hN_nope, hN_rope]
         #   Step 1: reshape to [head_count, head_width, input_dim] (head-major view)
         #   Step 2: split along dim=1 by part_dim → each part is [head_count, part_dim, input_dim]
-        #   Step 3: batched NS per (head, part) → concat along dim=1 → reshape_as(G)
+        #   Step 3: regroup consecutive heads per part -> batched NS -> inverse-regroup -> reshape_as(G)
         head_count = split_spec["head_count"]
         part_dims = [part_dim for _, part_dim in parts]
         head_width = sum(part_dims)
         input_dim = G.shape[1]
         head_major = G.reshape(head_count, head_width, input_dim)
+        group_size = _resolve_muon_head_group_size(head_group_size, head_count)
         part_updates = []
         for part_batch in torch.split(head_major, part_dims, dim=1):
-            part_updates.append(
-                _scaled_batched_zeropower(
-                    part_batch, steps, matched_adamw_rms
-                )
+            part_dim = part_batch.shape[1]
+            group_batch = part_batch.reshape(
+                head_count // group_size,
+                group_size * part_dim,
+                input_dim,
             )
+            group_update = _scaled_batched_zeropower(
+                group_batch, steps, matched_adamw_rms
+            )
+            part_updates.append(group_update.reshape(head_count, part_dim, input_dim))
         return torch.cat(part_updates, dim=1).reshape_as(G)
 
     if layout == "contiguous_parts":
@@ -269,6 +295,7 @@ class Muon(torch.optim.Optimizer):
         matched_adamw_rms: The AdamW Update RMS that Muon is designed to match. (0.2~0.4 recommended)
         nesterov: Whether to use Nesterov-style momentum in the internal SGD.
         ns_steps: The number of Newton-Schulz iterations to run. (5 is probably always enough).
+        muon_head_group_size: Consecutive attention heads per semantic NS block; 0 means all heads.
         adamw_betas: The betas for the internal AdamW.
         adamw_eps: The epsilon for the internal AdamW.
         adamw_wd: The weight decay for the internal AdamW.
@@ -282,7 +309,8 @@ class Muon(torch.optim.Optimizer):
                  nesterov: bool = True,
                  ns_steps: int = 5,
                  adamw_betas: Tuple[float, float] = (0.95, 0.95),
-                 adamw_eps: float = 1e-8):
+                 adamw_eps: float = 1e-8,
+                 muon_head_group_size: int = 1):
 
         defaults = dict(
             lr=lr,
@@ -294,9 +322,10 @@ class Muon(torch.optim.Optimizer):
             adamw_betas=adamw_betas,
             adamw_eps=adamw_eps,
         )
-        
+
         super().__init__(param_groups, defaults)
         self._muon_split_spec_by_param: Dict[torch.nn.Parameter, Dict[str, Any]] = {}
+        self._muon_head_group_size = muon_head_group_size
 
     def _set_muon_split_specs(
         self,
@@ -442,6 +471,7 @@ class Muon(torch.optim.Optimizer):
                         split_spec,
                         steps=ns_steps,
                         matched_adamw_rms=matched_adamw_rms,
+                        head_group_size=self._muon_head_group_size,
                     )
                     adjusted_lr = lr
                 

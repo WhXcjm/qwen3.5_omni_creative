@@ -297,6 +297,7 @@ class Trainer:
             matched_adamw_rms=args.training.matched_adamw_rms,
             muon_momentum=args.training.muon_momentum,
             ns_steps=args.training.ns_steps,
+            muon_head_group_size=args.training.muon_head_group_size,
         )
         return optimizer
 

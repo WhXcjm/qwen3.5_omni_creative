@@ -433,6 +433,7 @@ def build_optimizer(
     matched_adamw_rms: float = 0.2,
     muon_momentum: float = 0.95,
     ns_steps: int = 5,
+    muon_head_group_size: int = 1,
 ) -> "torch.optim.Optimizer":
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
     ps = get_parallel_state()
@@ -452,6 +453,7 @@ def build_optimizer(
             matched_adamw_rms=matched_adamw_rms,
             muon_momentum=muon_momentum,
             ns_steps=ns_steps,
+            muon_head_group_size=muon_head_group_size,
         )
     # Other cases remain the same
     if param_groups is None:
@@ -484,6 +486,7 @@ def build_optimizer(
             ns_steps=ns_steps,
             adamw_betas=betas,
             adamw_eps=eps,
+            muon_head_group_size=muon_head_group_size,
         )
         optim._set_muon_split_specs(split_specs)
     elif optimizer_type == "adamw":
@@ -510,6 +513,7 @@ def build_ep_fsdp2_optimizer(
     matched_adamw_rms: float = 0.2,
     muon_momentum: float = 0.95,
     ns_steps: int = 5,
+    muon_head_group_size: int = 1,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with EP+FSDP2
@@ -609,6 +613,7 @@ def build_ep_fsdp2_optimizer(
                 ns_steps=ns_steps,
                 adamw_betas=betas,
                 adamw_eps=eps,
+                muon_head_group_size=muon_head_group_size,
             )
             optim._set_muon_split_specs(split_specs)
             return optim

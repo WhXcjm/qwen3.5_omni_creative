@@ -174,6 +174,15 @@ class TrainingArguments(BaseArguments):
         default=5,
         metadata={"help": "Number of Newton-Schulz iterations for Muon orthogonalization."},
     )
+    muon_head_group_size: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Number of consecutive attention heads per Muon NS group. "
+                "Use 0 to group all heads; default 1 preserves per-head updates."
+            )
+        },
+    )
     adam_fused: bool = field(
         default=True,
         metadata={"help": "Whether to use fused AdamW optimizer for better performance."},
