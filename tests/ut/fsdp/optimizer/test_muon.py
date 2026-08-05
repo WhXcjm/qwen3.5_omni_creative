@@ -16,6 +16,7 @@ torch = pytest.importorskip("torch")
 
 from mindspeed_mm.optimizer.muon import (
     Muon,
+    _dynamic_matched_adamw_rms,
     _zeropower_via_newtonschulz5_split,
     zeropower_via_newtonschulz5,
 )
@@ -499,6 +500,153 @@ def test_muon_without_split_spec_preserves_whole_matrix_update():
     optimizer.step()
 
     torch.testing.assert_close(param, expected, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("step", "expected"),
+    [
+        (1, 1.0),
+        (2, 0.708085476162),
+        (5, 0.452122806989),
+        (10, 0.330125962050),
+        (18, 0.266873040174),
+        (20, 0.259230289798),
+        (50, 0.230601153557),
+        (177, 0.229415735697),
+        (1000, 0.229415733871),
+    ],
+)
+def test_dynamic_matched_adamw_rms_key_steps(step, expected):
+    assert _dynamic_matched_adamw_rms(step, 0.9) == pytest.approx(
+        expected, rel=0.0, abs=5e-13
+    )
+
+
+def test_dynamic_matched_adamw_rms_uses_per_param_step_and_roundtrips():
+    initial = torch.tensor([[1.0, -2.0], [3.0, -4.0]])
+    grad = torch.tensor([[0.5, -0.25], [0.125, -0.75]])
+    param = torch.nn.Parameter(initial.clone())
+    lr = 0.05
+    optimizer = Muon(
+        [{"params": [param], "use_muon": True}],
+        lr=lr,
+        weight_decay=0.0,
+        matched_adamw_rms=9.0,
+        dynamic_matched_adamw_rms=True,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=2,
+        adamw_betas=(0.9, 0.999),
+    )
+
+    # Like AdamW, a parameter's clock advances only when that parameter has a gradient.
+    optimizer.step()
+    assert param not in optimizer.state
+
+    param.grad = grad.clone()
+    optimizer.step()
+    assert optimizer.state[param]["step"] == 1
+    expected = initial.clone()
+    expected.add_(
+        zeropower_via_newtonschulz5(grad.to(torch.bfloat16), steps=2),
+        alpha=(
+            -lr
+            * _dynamic_matched_adamw_rms(1, 0.9)
+            * math.sqrt(max(grad.shape))
+        ),
+    )
+    torch.testing.assert_close(param, expected, rtol=0.0, atol=0.0)
+
+    state_dict = copy.deepcopy(optimizer.state_dict())
+    restored = torch.nn.Parameter(param.detach().clone())
+    restored_optimizer = Muon(
+        [{"params": [restored], "use_muon": True}],
+        lr=lr,
+        weight_decay=0.0,
+        matched_adamw_rms=9.0,
+        dynamic_matched_adamw_rms=True,
+        momentum=0.0,
+        nesterov=False,
+        ns_steps=2,
+        adamw_betas=(0.8, 0.999),
+    )
+    restored_optimizer.load_state_dict(state_dict)
+    assert restored_optimizer.param_groups[0]["adamw_betas"] == (0.9, 0.999)
+    assert restored_optimizer.state[restored]["step"] == 1
+
+    next_grad = grad.flip(0)
+    param.grad = next_grad.clone()
+    restored.grad = next_grad.clone()
+    optimizer.step()
+    restored_optimizer.step()
+    torch.testing.assert_close(param, restored, rtol=0.0, atol=0.0)
+    assert optimizer.state[param]["step"] == 2
+    assert restored_optimizer.state[restored]["step"] == 2
+
+
+def test_fixed_matched_adamw_rms_keeps_optimizer_state_unchanged():
+    param = torch.nn.Parameter(torch.zeros(2, 2))
+    optimizer = Muon([{"params": [param], "use_muon": True}])
+
+    param.grad = torch.ones_like(param)
+    optimizer.step()
+    assert set(optimizer.state[param]) == {"muon_buffer"}
+
+
+def test_dynamic_matched_adamw_rms_multi_optimizer_dcp_roundtrip():
+    optimizer_module = _load_optimizer_module()
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ep = torch.nn.Parameter(torch.randn(2, 2))
+            self.non_ep = torch.nn.Parameter(torch.randn(2, 2))
+
+    def make_multi_optimizer(model):
+        optimizers = {
+            name: Muon(
+                [{"params": [getattr(model, name)], "use_muon": True}],
+                dynamic_matched_adamw_rms=True,
+                adamw_betas=(0.9, 0.999),
+                momentum=0.0,
+                nesterov=False,
+                weight_decay=0.0,
+            )
+            for name in ("ep", "non_ep")
+        }
+        return optimizer_module.MultiOptimizer(
+            model, optimizers, key_names=["ep", "non_ep"]
+        )
+
+    torch.manual_seed(15)
+    original_model = TinyModel()
+    original_optimizer = make_multi_optimizer(original_model)
+    for param in original_model.parameters():
+        param.grad = torch.ones_like(param)
+    original_optimizer.step()
+
+    dcp_state = copy.deepcopy(original_optimizer.state_dict())
+    restored_model = TinyModel()
+    restored_model.load_state_dict(original_model.state_dict())
+    restored_optimizer = make_multi_optimizer(restored_model)
+    restored_optimizer.load_state_dict(dcp_state)
+
+    for optimizer in restored_optimizer.optimizers_dict.values():
+        param = optimizer.param_groups[0]["params"][0]
+        assert optimizer.state[param]["step"] == 1
+
+    for original, restored in zip(
+        original_model.parameters(), restored_model.parameters()
+    ):
+        next_grad = torch.arange(4, dtype=original.dtype).reshape_as(original)
+        original.grad = next_grad.clone()
+        restored.grad = next_grad.clone()
+    original_optimizer.step()
+    restored_optimizer.step()
+    for original, restored in zip(
+        original_model.parameters(), restored_model.parameters()
+    ):
+        torch.testing.assert_close(original, restored, rtol=0.0, atol=0.0)
 
 
 def test_split_muon_state_roundtrip_keeps_runtime_metadata():

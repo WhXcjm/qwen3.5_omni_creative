@@ -158,6 +158,17 @@ def _scaled_batched_zeropower(matrices, steps, matched_adamw_rms):
     return update * scale
 
 
+def _dynamic_matched_adamw_rms(step: int, beta1: float) -> float:
+    """Idealized AdamW normalized-update RMS at a 1-based parameter update step."""
+    if step < 1:
+        raise ValueError("Dynamic matched AdamW RMS step must be at least 1")
+    beta1_power = beta1 ** step
+    return math.sqrt(
+        (1 - beta1) / (1 + beta1)
+        * (1 + beta1_power) / (1 - beta1_power)
+    )
+
+
 def _zeropower_via_newtonschulz5_split(
     G,
     split_spec,
@@ -296,6 +307,7 @@ class Muon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD.
         ns_steps: The number of Newton-Schulz iterations to run. (5 is probably always enough).
         muon_head_group_size: Consecutive attention heads per semantic NS block; 0 means all heads.
+        dynamic_matched_adamw_rms: Derive matched_adamw_rms from AdamW beta1 and parameter update step.
         adamw_betas: The betas for the internal AdamW.
         adamw_eps: The epsilon for the internal AdamW.
         adamw_wd: The weight decay for the internal AdamW.
@@ -310,7 +322,8 @@ class Muon(torch.optim.Optimizer):
                  ns_steps: int = 5,
                  adamw_betas: Tuple[float, float] = (0.95, 0.95),
                  adamw_eps: float = 1e-8,
-                 muon_head_group_size: int = 1):
+                 muon_head_group_size: int = 1,
+                 dynamic_matched_adamw_rms: bool = False):
 
         defaults = dict(
             lr=lr,
@@ -326,6 +339,7 @@ class Muon(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
         self._muon_split_spec_by_param: Dict[torch.nn.Parameter, Dict[str, Any]] = {}
         self._muon_head_group_size = muon_head_group_size
+        self._dynamic_matched_adamw_rms = dynamic_matched_adamw_rms
 
     def _set_muon_split_specs(
         self,
@@ -411,6 +425,13 @@ class Muon(torch.optim.Optimizer):
                 if ns_input is None:
                     continue
 
+                param_matched_adamw_rms = matched_adamw_rms
+                if self._dynamic_matched_adamw_rms:
+                    state["step"] = int(state.get("step", 0)) + 1
+                    param_matched_adamw_rms = _dynamic_matched_adamw_rms(
+                        state["step"], group["adamw_betas"][0]
+                    )
+
                 split_spec = self._muon_split_spec_by_param.get(p)
                 
                 # Handle FSDP sharding
@@ -463,14 +484,14 @@ class Muon(torch.optim.Optimizer):
                         ns_input_local, steps=ns_steps
                     )
                     adjusted_lr = adjust_lr_wd_for_muon(
-                        lr, matched_adamw_rms, ns_input.shape
+                        lr, param_matched_adamw_rms, ns_input.shape
                     )
                 else:
                     update = _zeropower_via_newtonschulz5_split(
                         ns_input_local,
                         split_spec,
                         steps=ns_steps,
-                        matched_adamw_rms=matched_adamw_rms,
+                        matched_adamw_rms=param_matched_adamw_rms,
                         head_group_size=self._muon_head_group_size,
                     )
                     adjusted_lr = lr
