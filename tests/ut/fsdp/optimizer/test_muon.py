@@ -1,6 +1,7 @@
 # pylint: skip-file
 import copy
 import importlib.util
+import logging
 import math
 import os
 from pathlib import Path
@@ -147,6 +148,135 @@ def test_mark_muon_param_groups_routes_fallbacks_and_covers_all_params_once():
         assert group["lr"] == 0.25
         assert group["weight_decay"] == 0.01
         assert group["group_name"] == "test"
+
+
+def _tiny_pattern_model():
+    class TinyLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear_attn = torch.nn.Module()
+            self.linear_attn.in_proj_a = torch.nn.Linear(8, 2, bias=False)
+            self.linear_attn.in_proj_b = torch.nn.Linear(8, 2, bias=False)
+            self.linear_attn.in_proj_z = torch.nn.Linear(8, 8, bias=False)
+
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.language_model = torch.nn.Module()
+    model.model.language_model.layers = torch.nn.ModuleList(
+        [TinyLayer(), TinyLayer()]
+    )
+    return model
+
+
+def test_muon_adamw_patterns_use_full_names_and_preserve_group_metadata():
+    optimizer_module = _load_optimizer_module()
+    model = _tiny_pattern_model()
+    patterns = [
+        "model.language_model.layers.{*}.linear_attn.in_proj_a.weight",
+        "model.language_model.layers.{*}.linear_attn.in_proj_b.weight",
+    ]
+
+    forced_adamw_params = optimizer_module._resolve_muon_adamw_params(
+        model, patterns
+    )
+    groups, split_specs = optimizer_module._mark_muon_param_groups(
+        model,
+        [{"params": list(model.parameters()), "lr": 0.25, "group_name": "test"}],
+        forced_adamw_params,
+    )
+
+    assert len(forced_adamw_params) == 4
+    assert split_specs == {}
+    name_by_param = {param: name for name, param in model.named_parameters()}
+    routed_names = {True: set(), False: set()}
+    for group in groups:
+        routed_names[group["use_muon"]].update(
+            name_by_param[param] for param in group["params"]
+        )
+        assert group["lr"] == 0.25
+        assert group["group_name"] == "test"
+        assert "muon_adamw_param_patterns" not in group
+
+    assert routed_names[False] == {
+        f"model.language_model.layers.{layer}.linear_attn.{projection}.weight"
+        for layer in range(2)
+        for projection in ("in_proj_a", "in_proj_b")
+    }
+    assert routed_names[True] == {
+        f"model.language_model.layers.{layer}.linear_attn.in_proj_z.weight"
+        for layer in range(2)
+    }
+
+
+def test_muon_adamw_patterns_fail_fast_on_invalid_or_missing_matches():
+    optimizer_module = _load_optimizer_module()
+    model = _tiny_pattern_model()
+
+    with pytest.raises(ValueError, match="matched no trainable parameters"):
+        optimizer_module._resolve_muon_adamw_params(
+            model,
+            ["model.language_model.layers.{*}.linear_attn.missing.weight"],
+        )
+    with pytest.raises(ValueError, match="only a complete '\\{\\*\\}' segment"):
+        optimizer_module._resolve_muon_adamw_params(
+            model,
+            ["model.language_model.layers.*.linear_attn.in_proj_a.weight"],
+        )
+    with pytest.raises(ValueError, match="requires optimizer='muon'"):
+        optimizer_module.build_optimizer(
+            model,
+            optimizer_type="adamw",
+            muon_adamw_param_patterns=[
+                "model.language_model.layers.{*}.linear_attn.in_proj_a.weight"
+            ],
+        )
+
+
+def test_muon_adamw_patterns_reject_overlapping_rules():
+    optimizer_module = _load_optimizer_module()
+    model = _tiny_pattern_model()
+
+    with pytest.raises(ValueError, match="matched more than once"):
+        optimizer_module._resolve_muon_adamw_params(
+            model,
+            [
+                "model.language_model.layers.{*}.linear_attn.in_proj_a.weight",
+                "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+            ],
+        )
+
+
+def test_forced_adamw_param_warns_when_split_spec_is_ignored(caplog):
+    optimizer_module = _load_optimizer_module()
+
+    class LayoutModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fused = torch.nn.Linear(4, 6, bias=False)
+            self._muon_layout_specs = {
+                "fused.weight": {
+                    "layout": "contiguous_parts",
+                    "expected_shape": (6, 4),
+                    "parts": (("left", 2), ("right", 4)),
+                }
+            }
+
+    model = LayoutModel()
+    with caplog.at_level(logging.WARNING, logger=optimizer_module.__name__):
+        marked_groups, split_specs = optimizer_module._mark_muon_param_groups(
+            model,
+            [{"params": list(model.parameters())}],
+            {model.fused.weight},
+        )
+
+    assert split_specs == {}
+    assert len(marked_groups) == 1
+    assert marked_groups[0]["params"] == [model.fused.weight]
+    assert marked_groups[0]["use_muon"] is False
+    assert (
+        "Ignoring Muon split metadata for fused.weight because it is forced to AdamW"
+        in caplog.text
+    )
 
 
 def test_mark_muon_param_groups_collects_parameter_layouts_and_opts_in_experts():

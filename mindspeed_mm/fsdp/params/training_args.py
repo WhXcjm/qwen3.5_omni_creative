@@ -157,6 +157,15 @@ class TrainingArguments(BaseArguments):
         default="adamw",
         metadata={"help": "Optimizer. Supported: adamw, muon. Default to adamw."},
     )
+    muon_adamw_param_patterns: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Fully qualified parameter-name patterns forced to Muon's AdamW path. "
+                "The token '{*}' matches exactly one dotted name segment."
+            )
+        },
+    )
     matched_adamw_rms: float = field(
         default=0.2,
         metadata={

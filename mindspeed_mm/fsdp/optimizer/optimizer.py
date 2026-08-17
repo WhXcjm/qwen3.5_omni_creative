@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from collections import ChainMap
 import logging
 
@@ -170,6 +170,65 @@ def _matches_muon_fallback_name(name: str) -> bool:
     return False
 
 
+def _validate_muon_adamw_pattern(pattern: str) -> Tuple[str, ...]:
+    if not isinstance(pattern, str):
+        raise TypeError("Muon AdamW parameter patterns must be strings")
+
+    segments = tuple(pattern.split("."))
+    if not pattern or any(not segment for segment in segments):
+        raise ValueError(f"Invalid Muon AdamW parameter pattern: {pattern!r}")
+
+    for segment in segments:
+        if segment == "{*}":
+            continue
+        if any(token in segment for token in ("*", "?", "[", "]", "{", "}")):
+            raise ValueError(
+                f"Unsupported wildcard in Muon AdamW parameter pattern {pattern!r}; "
+                "only a complete '{*}' segment is allowed"
+            )
+    return segments
+
+
+def _matches_muon_adamw_pattern(name: str, pattern_segments: Tuple[str, ...]) -> bool:
+    name_segments = name.split(".")
+    return len(name_segments) == len(pattern_segments) and all(
+        pattern == "{*}" or pattern == segment
+        for pattern, segment in zip(pattern_segments, name_segments)
+    )
+
+
+def _resolve_muon_adamw_params(
+    model: "nn.Module",
+    patterns: Optional[Sequence[str]],
+) -> Set[torch.nn.Parameter]:
+    trainable_named_params = [
+        (name, param) for name, param in model.named_parameters() if param.requires_grad
+    ]
+    matched_patterns: Dict[torch.nn.Parameter, str] = {}
+
+    for pattern in patterns or ():
+        pattern_segments = _validate_muon_adamw_pattern(pattern)
+        matches = [
+            (name, param)
+            for name, param in trainable_named_params
+            if _matches_muon_adamw_pattern(name, pattern_segments)
+        ]
+        if not matches:
+            raise ValueError(
+                f"Muon AdamW parameter pattern {pattern!r} matched no trainable parameters"
+            )
+        for name, param in matches:
+            previous_pattern = matched_patterns.get(param)
+            if previous_pattern is not None:
+                raise ValueError(
+                    f"Muon AdamW parameter {name!r} matched more than once: "
+                    f"{previous_pattern!r} and {pattern!r}"
+                )
+            matched_patterns[param] = pattern
+
+    return set(matched_patterns)
+
+
 # Check if a parameter is eligible for Muon optimization.
 def _is_muon_eligible(name: str, param: torch.nn.Parameter) -> bool:
     return len(param.shape) == 2 and not _matches_muon_fallback_name(name)
@@ -224,8 +283,10 @@ def _collect_muon_split_specs(
 def _mark_muon_param_groups(
     model: "nn.Module",
     param_groups: Sequence[Dict[str, Any]],
+    forced_adamw_params: Optional[Set[torch.nn.Parameter]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[torch.nn.Parameter, Dict[str, Any]]]:
     name_by_param = {p: n for n, p in model.named_parameters()}
+    forced_adamw_params = forced_adamw_params or set()
     declared_split_specs = _collect_muon_split_specs(model)
     selected_split_specs: Dict[torch.nn.Parameter, Dict[str, Any]] = {}
     marked_groups: List[Dict[str, Any]] = []
@@ -244,7 +305,14 @@ def _mark_muon_param_groups(
                 split_spec is not None
                 and split_spec.get("layout") == "expert_batched_parts"
             )
-            if _is_muon_eligible(param_name, p) or is_declared_expert:
+            if p in forced_adamw_params:
+                fallback_params.append(p)
+                if split_spec is not None:
+                    logger.warning(
+                        "Ignoring Muon split metadata for %s because it is forced to AdamW",
+                        param_name,
+                    )
+            elif _is_muon_eligible(param_name, p) or is_declared_expert:
                 muon_params.append(p)
                 if split_spec is not None:
                     selected_split_specs[p] = split_spec
@@ -430,12 +498,19 @@ def build_optimizer(
     param_groups: Optional[Sequence[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
+    muon_adamw_param_patterns: Optional[List[str]] = None,
     matched_adamw_rms: float = 0.2,
     muon_momentum: float = 0.95,
     ns_steps: int = 5,
     muon_head_group_size: int = 1,
     dynamic_matched_adamw_rms: bool = False,
 ) -> "torch.optim.Optimizer":
+    if muon_adamw_param_patterns and optimizer_type != "muon":
+        raise ValueError("muon_adamw_param_patterns requires optimizer='muon'")
+    forced_adamw_params = _resolve_muon_adamw_params(
+        model, muon_adamw_param_patterns
+    )
+
     # EP-aware routing: for FSDP2+EP, split params into EP and non-EP groups and build two optimizers.
     ps = get_parallel_state()
     if ps.get_ep_group_size() > 1:
@@ -451,6 +526,7 @@ def build_optimizer(
             param_groups,
             no_decay_modules,
             no_decay_params,
+            forced_adamw_params=forced_adamw_params,
             matched_adamw_rms=matched_adamw_rms,
             dynamic_matched_adamw_rms=dynamic_matched_adamw_rms,
             muon_momentum=muon_momentum,
@@ -477,7 +553,9 @@ def build_optimizer(
             param_groups.append({"params": no_decay_parameters, "weight_decay": 0.0})
 
     if optimizer_type == "muon":
-        param_groups, split_specs = _mark_muon_param_groups(model, param_groups)
+        param_groups, split_specs = _mark_muon_param_groups(
+            model, param_groups, forced_adamw_params
+        )
         logger.info(f"Muon parameter groups: {param_groups}")
         optim = Muon(
             param_groups,
@@ -513,6 +591,7 @@ def build_ep_fsdp2_optimizer(
     param_groups: Optional[List[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
+    forced_adamw_params: Optional[Set[torch.nn.Parameter]] = None,
     matched_adamw_rms: float = 0.2,
     muon_momentum: float = 0.95,
     ns_steps: int = 5,
@@ -607,7 +686,9 @@ def build_ep_fsdp2_optimizer(
         foreach = not fused
         fused_ = fused
         if optimizer_type == "muon":
-            groups, split_specs = _mark_muon_param_groups(model, groups)
+            groups, split_specs = _mark_muon_param_groups(
+                model, groups, forced_adamw_params
+            )
             optim = Muon(
                 groups,
                 lr=lr,
