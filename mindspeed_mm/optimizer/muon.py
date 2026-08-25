@@ -102,11 +102,19 @@ def _validate_muon_split_spec(param, split_spec):
     if layout == "contiguous_head_parts":
         # Contiguous by semantic type, e.g. GatedDeltaNet in_proj_qkv:
         #   [Q_head0 | ... | Q_headN | K_head0 | ... | K_headN | V_head0 | ... | V_headM]
-        # parts: ((name, head_count, head_dim), ...).
-        if len(expected_shape) != 2 or not _valid_muon_parts(parts, 3):
+        # parts: ((name, head_count, head_dim), ...).  head_axis identifies
+        # whether the packed heads occupy rows (0) or columns (1).
+        head_axis = split_spec.get("head_axis", 0)
+        if (
+            len(expected_shape) != 2
+            or not isinstance(head_axis, int)
+            or isinstance(head_axis, bool)
+            or head_axis not in (0, 1)
+            or not _valid_muon_parts(parts, 3)
+        ):
             raise ValueError("Invalid contiguous_head_parts metadata")
         split_size = sum(head_count * head_dim for _, head_count, head_dim in parts)
-        expected_size = expected_shape[0]
+        expected_size = expected_shape[head_axis]
     elif layout == "periodic_head_parts":
         # Head-interleaved layout, e.g. MLA q_b_proj / kv_b_proj:
         #   [head0·nope, head0·rope, head1·nope, head1·rope, ..., headN·nope, headN·rope]
@@ -195,29 +203,35 @@ def _zeropower_via_newtonschulz5_split(
     if layout == "contiguous_head_parts":
         # Contiguous by semantic type, e.g. GatedDeltaNet in_proj_qkv:
         #   G = [Q_head0 | ... | Q_headN | K_head0 | ... | K_headN | V_head0 | ... | V_headM]
-        #   Step 1: narrow each part's row range → reshape to [head_count, head_dim, input_dim]
+        #   Step 1: move the declared head axis to rows, then narrow each part
+        #           and reshape to [head_count, head_dim, matrix_dim]
         #   Step 2: regroup consecutive heads -> batched NS per head group -> reshape back to 2D
-        #   Step 3: concat along dim=0, restoring the original row order
-        input_dim = G.shape[1]
+        #   Step 3: concat and restore the original matrix axis order
+        head_axis = split_spec.get("head_axis", 0)
+        axis_normalized = G.movedim(head_axis, 0)
+        matrix_dim = axis_normalized.shape[1]
         offset = 0
         updates = []
         for _, head_count, head_dim in parts:
             row_count = head_count * head_dim
-            head_batch = G.narrow(0, offset, row_count).reshape(
-                head_count, head_dim, input_dim
+            head_batch = axis_normalized.narrow(0, offset, row_count).reshape(
+                head_count, head_dim, matrix_dim
             )
             group_size = _resolve_muon_head_group_size(head_group_size, head_count)
             group_batch = head_batch.reshape(
                 head_count // group_size,
                 group_size * head_dim,
-                input_dim,
+                matrix_dim,
             )
             group_update = _scaled_batched_zeropower(
                 group_batch, steps, matched_adamw_rms
             )
-            updates.append(group_update.reshape(row_count, input_dim))
+            updates.append(group_update.reshape(row_count, matrix_dim))
             offset += row_count
-        return torch.cat(updates, dim=0)
+        # The strict Task6 layouts are single-part matrices.  Avoid copying the
+        # complete update through torch.cat in that common hot path.
+        axis_update = updates[0] if len(updates) == 1 else torch.cat(updates, dim=0)
+        return axis_update.movedim(0, head_axis)
 
     if layout == "periodic_head_parts":
         # Head-interleaved layout, e.g. MLA q_b_proj / kv_b_proj:

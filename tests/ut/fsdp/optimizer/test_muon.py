@@ -9,12 +9,14 @@ import sys
 import types
 
 import pytest
+import yaml
 
 os.environ.setdefault("NON_MEGATRON", "true")
 os.environ.setdefault("MINDSPEED_MM_DISABLE_FSDP_OPS_PATCH", "true")
 
 torch = pytest.importorskip("torch")
 
+import mindspeed_mm.optimizer.muon as muon_module
 from mindspeed_mm.optimizer.muon import (
     Muon,
     _dynamic_matched_adamw_rms,
@@ -166,6 +168,68 @@ def _tiny_pattern_model():
         [TinyLayer(), TinyLayer()]
     )
     return model
+
+
+def _load_repo_yaml(relative_path):
+    repo_root = Path(__file__).resolve().parents[4]
+    with (repo_root / relative_path).open(encoding="utf-8") as config_file:
+        return yaml.safe_load(config_file)
+
+
+def test_task6_yaml_keeps_in_proj_a_b_on_muon():
+    optimizer_module = _load_optimizer_module()
+    config = _load_repo_yaml(
+        "scripts_qwen3_5/longTest/longTest_06-new_dyn_lr4e-4_hg1.yaml"
+    )
+    training = config["training"]
+
+    assert training["muon_head_group_size"] == 1
+    assert "muon_adamw_param_patterns" not in training
+
+    model = _tiny_pattern_model()
+    forced_adamw_params = optimizer_module._resolve_muon_adamw_params(
+        model, training.get("muon_adamw_param_patterns")
+    )
+    groups, _ = optimizer_module._mark_muon_param_groups(
+        model,
+        [{"params": list(model.parameters())}],
+        forced_adamw_params,
+    )
+
+    assert forced_adamw_params == set()
+    name_by_param = {param: name for name, param in model.named_parameters()}
+    routed_names = {True: set(), False: set()}
+    for group in groups:
+        routed_names[group["use_muon"]].update(
+            name_by_param[param] for param in group["params"]
+        )
+
+    expected_muon_names = {
+        f"model.language_model.layers.{layer}.linear_attn.{projection}.weight"
+        for layer in range(2)
+        for projection in ("in_proj_a", "in_proj_b")
+    }
+    assert expected_muon_names <= routed_names[True]
+    assert expected_muon_names.isdisjoint(routed_names[False])
+
+
+def test_task6_yaml_matches_t2_dynamic_training_semantics():
+    task6 = _load_repo_yaml(
+        "scripts_qwen3_5/longTest/longTest_06-new_dyn_lr4e-4_hg1.yaml"
+    )
+    t2_dynamic = _load_repo_yaml(
+        "scripts_qwen3_5/configs/qwen3_5_10B-A2B_exp4_config_dynamic_rms.yaml"
+    )
+
+    # Long tests intentionally disable checkpoint writes.  Apart from that
+    # operational setting and the output path, every parsed field must match.
+    assert t2_dynamic["training"]["save_interval"] == 1000
+    assert task6["training"]["save_interval"] == 99999
+    for config in (task6, t2_dynamic):
+        config["training"].pop("save")
+        config["training"].pop("save_interval")
+
+    assert task6 == t2_dynamic
 
 
 def test_muon_adamw_patterns_use_full_names_and_preserve_group_metadata():
@@ -379,6 +443,120 @@ def test_contiguous_head_parts_match_independent_per_head_reference():
     torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
 
 
+def test_contiguous_head_parts_support_column_head_axis():
+    torch.manual_seed(2)
+    matrix = torch.randn(5, 12, dtype=torch.float64)
+    split_spec = {
+        "layout": "contiguous_head_parts",
+        "expected_shape": (5, 12),
+        "head_axis": 1,
+        "parts": (("value", 3, 4),),
+    }
+
+    actual = _zeropower_via_newtonschulz5_split(matrix, split_spec, 2, 0.2)
+    expected = torch.cat(
+        [
+            _scaled_reference(head, 2, 0.2)
+            for head in torch.split(matrix, 4, dim=1)
+        ],
+        dim=1,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("matrix_shape", "head_axis", "head_count", "head_dim"),
+    (
+        pytest.param((32, 5), 0, 16, 2, id="gdn-in-proj-z-row-heads"),
+        pytest.param((5, 32), 1, 16, 2, id="gdn-out-proj-column-heads"),
+        pytest.param((5, 24), 1, 8, 3, id="mla-o-proj-column-heads"),
+    ),
+)
+def test_task6_strict_per_head_layouts_match_independent_reference(
+    matrix_shape, head_axis, head_count, head_dim
+):
+    torch.manual_seed(26)
+    matrix = torch.randn(*matrix_shape, dtype=torch.float64)
+    split_spec = {
+        "layout": "contiguous_head_parts",
+        "expected_shape": matrix_shape,
+        "head_axis": head_axis,
+        "parts": (("value", head_count, head_dim),),
+    }
+
+    actual = _zeropower_via_newtonschulz5_split(
+        matrix, split_spec, 2, 0.2, head_group_size=1
+    )
+    expected = torch.cat(
+        [
+            _scaled_reference(head, 2, 0.2)
+            for head in torch.split(matrix, head_dim, dim=head_axis)
+        ],
+        dim=head_axis,
+    )
+
+    assert actual.shape == matrix.shape
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("matrix_shape", "head_axis", "head_count", "head_dim", "matrix_dim"),
+    (
+        pytest.param((32, 5), 0, 16, 2, 5, id="gdn-in-proj-z-row-heads"),
+        pytest.param((5, 32), 1, 16, 2, 5, id="gdn-out-proj-column-heads"),
+        pytest.param((5, 24), 1, 8, 3, 5, id="mla-o-proj-column-heads"),
+    ),
+)
+def test_task6_hg1_uses_one_independent_ns_batch_per_matrix(
+    monkeypatch, matrix_shape, head_axis, head_count, head_dim, matrix_dim
+):
+    matrix = torch.arange(math.prod(matrix_shape), dtype=torch.float64).reshape(
+        matrix_shape
+    )
+    split_spec = {
+        "layout": "contiguous_head_parts",
+        "expected_shape": matrix_shape,
+        "head_axis": head_axis,
+        "parts": (("value", head_count, head_dim),),
+    }
+    calls = []
+
+    def identity_batched_ns(matrices, steps, matched_adamw_rms):
+        calls.append((tuple(matrices.shape), steps, matched_adamw_rms))
+        return matrices
+
+    monkeypatch.setattr(
+        muon_module, "_scaled_batched_zeropower", identity_batched_ns
+    )
+    actual = muon_module._zeropower_via_newtonschulz5_split(
+        matrix, split_spec, 2, 0.2, head_group_size=1
+    )
+
+    assert calls == [((head_count, head_dim, matrix_dim), 2, 0.2)]
+    assert actual.shape == matrix.shape
+    torch.testing.assert_close(actual, matrix, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize(("shape", "head_axis"), [((12, 5), 0), ((5, 12), 1)])
+def test_single_contiguous_head_part_hg0_matches_whole_matrix(shape, head_axis):
+    torch.manual_seed(3)
+    matrix = torch.randn(*shape, dtype=torch.float64)
+    split_spec = {
+        "layout": "contiguous_head_parts",
+        "expected_shape": shape,
+        "head_axis": head_axis,
+        "parts": (("value", 3, 4),),
+    }
+
+    actual = _zeropower_via_newtonschulz5_split(
+        matrix, split_spec, 2, 0.2, head_group_size=0
+    )
+    expected = _scaled_reference(matrix, 2, 0.2)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+
+
 def test_periodic_head_parts_match_independent_per_head_part_reference():
     torch.manual_seed(2)
     matrix = torch.randn(8, 5, dtype=torch.float64)
@@ -413,17 +591,19 @@ def test_periodic_head_parts_match_independent_per_head_part_reference():
 def _grouped_head_reference(matrix, split_spec, head_group_size):
     layout = split_spec["layout"]
     if layout == "contiguous_head_parts":
+        head_axis = split_spec.get("head_axis", 0)
+        axis_normalized = matrix.movedim(head_axis, 0)
         updates, offset = [], 0
         for _, head_count, head_dim in split_spec["parts"]:
             group_size = head_count if head_group_size == 0 else head_group_size
             row_count = head_count * head_dim
-            part = matrix[offset: offset + row_count]
+            part = axis_normalized[offset: offset + row_count]
             updates.extend(
                 _scaled_reference(group, 2, 0.2)
                 for group in torch.split(part, group_size * head_dim, dim=0)
             )
             offset += row_count
-        return torch.cat(updates, dim=0)
+        return torch.cat(updates, dim=0).movedim(0, head_axis)
 
     head_count = split_spec["head_count"]
     group_size = head_count if head_group_size == 0 else head_group_size
@@ -459,6 +639,15 @@ def test_head_layouts_apply_ns_per_consecutive_semantic_group(head_group_size):
                 "parts": (("nope", 3), ("rope", 1)),
             },
         ),
+        (
+            torch.randn(5, 16, dtype=torch.float64),
+            {
+                "layout": "contiguous_head_parts",
+                "expected_shape": (5, 16),
+                "head_axis": 1,
+                "parts": (("value", 4, 4),),
+            },
+        ),
     )
     for matrix, split_spec in cases:
         actual = _zeropower_via_newtonschulz5_split(
@@ -471,6 +660,25 @@ def test_head_layouts_apply_ns_per_consecutive_semantic_group(head_group_size):
                 matrix, split_spec, 2, 0.2, head_group_size=4
             )
             torch.testing.assert_close(actual, explicit_all, rtol=0.0, atol=0.0)
+
+
+def test_contiguous_head_parts_validates_head_axis_and_coverage():
+    param = torch.nn.Parameter(torch.zeros(5, 12))
+    optimizer = Muon([{"params": [param], "use_muon": True}])
+    split_spec = {
+        "layout": "contiguous_head_parts",
+        "expected_shape": (5, 12),
+        "head_axis": 2,
+        "parts": (("value", 3, 4),),
+    }
+
+    with pytest.raises(ValueError, match="Invalid contiguous_head_parts metadata"):
+        optimizer._set_muon_split_specs({param: split_spec})
+
+    split_spec["head_axis"] = 1
+    split_spec["parts"] = (("value", 2, 4),)
+    with pytest.raises(ValueError, match="cover 8 values, expected 12"):
+        optimizer._set_muon_split_specs({param: split_spec})
 
 
 def test_head_group_size_must_divide_head_count():

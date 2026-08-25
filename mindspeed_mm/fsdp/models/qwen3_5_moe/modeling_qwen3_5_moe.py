@@ -601,12 +601,25 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             "in_proj_qkv.weight": {
                 "layout": "contiguous_head_parts",
                 "expected_shape": (self.key_dim * 2 + self.value_dim, self.hidden_size),
+                "head_axis": 0,
                 "parts": (
                     ("q", self.num_k_heads, self.head_k_dim),
                     ("k", self.num_k_heads, self.head_k_dim),
                     ("value", self.num_v_heads, self.head_v_dim),
                 ),
-            }
+            },
+            "in_proj_z.weight": {
+                "layout": "contiguous_head_parts",
+                "expected_shape": (self.value_dim, self.hidden_size),
+                "head_axis": 0,
+                "parts": (("z", self.num_v_heads, self.head_v_dim),),
+            },
+            "out_proj.weight": {
+                "layout": "contiguous_head_parts",
+                "expected_shape": (self.hidden_size, self.value_dim),
+                "head_axis": 1,
+                "parts": (("value", self.num_v_heads, self.head_v_dim),),
+            },
         }
 
     def _get_local_conv1d_weight(self, ulysses_rank: int, local_key_dim: int, local_value_dim: int) -> torch.Tensor:
@@ -1055,6 +1068,15 @@ class Qwen3_5MoeMLA(nn.Module):
                     ("k_nope", self.qk_nope_head_dim),
                     ("value", self.v_head_dim),
                 ),
+            },
+            "o_proj.weight": {
+                "layout": "contiguous_head_parts",
+                "expected_shape": (
+                    config.hidden_size,
+                    self.num_heads * self.v_head_dim,
+                ),
+                "head_axis": 1,
+                "parts": (("value", self.num_heads, self.v_head_dim),),
             },
         }
 
