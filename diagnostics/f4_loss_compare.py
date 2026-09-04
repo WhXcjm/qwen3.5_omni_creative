@@ -12,17 +12,18 @@ are intended for noisy, per-step training loss:
 * trailing mean over the latest 25 iterations;
 * no centered mean unless explicitly requested (it uses future observations).
 
-Usage example (PowerShell, run from the repository/worktree root):
+Usage example (PowerShell, run from the logs' root):
 
-    uv run --no-project diagnostics/f4_loss_compare.py `
-      --run "AdamW=D:/logs/adamw.log" `
-      --run "WrongMuon=D:/logs/wrong_muon.log" `
-      --run "F1=D:/logs/f1.log" `
-      --run "F2=D:/logs/f2.log" `
-      --baseline F1 `
-      --ema-halflife 20 --curve ema --confirm-points 3 `
-      --at-step 177 --at-step 300 --at-step 700 `
-      --csv f4_loss_h20.csv --html f4_loss_h20.html
+uv run --no-project f4_loss_compare.py `
+    --run "AdamW=adam_lr4e-4_5k-its.log" `
+    --run "F1=muon_lr4e-4_r1_1k-5k-its.log" `
+    --run "Split=longTest_08-f2-split-only.log" `
+    --run "F2=longTest_01_nodyn_lr4e-4_hg1_5k-its.log" `
+    --baseline AdamW `
+    --ema-halflife 5 --curve ema --confirm-points 3 `
+      --threshold 3.8 --threshold 3.7 --threshold 3.6 `
+      --threshold 3.5 --threshold 3.4 `
+    --html adamw-f2_equal_loss.html
 
 Repeat with ``--ema-halflife 50`` and different output filenames for a more
 heavily smoothed robustness check. To compare selected equal-loss levels,
@@ -463,6 +464,16 @@ def first_reach(
     return None
 
 
+def relative_step_lead(
+    reference_reach: float | None, candidate_reach: float | None
+) -> float | None:
+    """Return iteration lead as a percentage of the reference reach."""
+
+    if reference_reach is None or candidate_reach is None or reference_reach <= 0:
+        return None
+    return (reference_reach - candidate_reach) / reference_reach * 100.0
+
+
 def automatic_thresholds(
     smoothed: Mapping[str, Sequence[SmoothedPoint]], curve: str, count: int
 ) -> list[float]:
@@ -738,14 +749,22 @@ def print_report(
                 f" | {_format_number(value, 10):>14}" for value in consumed
             )
             print(consumed_row + "  (linearly interpolated)")
-            if reaches[0] is not None:
-                leads = [
-                    None if reach is None else reaches[0] - reach for reach in reaches
-                ]
-                lead_row = "  step lead" + "".join(
-                    f" | {_format_number(lead, 8):>14}" for lead in leads
-                )
-                print(lead_row + "  (positive = earlier than reference)")
+            leads = [
+                None if reaches[0] is None or reach is None else reaches[0] - reach
+                for reach in reaches
+            ]
+            lead_row = "  step lead" + "".join(
+                f" | {_format_number(lead, 8):>14}" for lead in leads
+            )
+            print(lead_row + "  (positive = earlier than reference)")
+            relative_leads = [
+                relative_step_lead(reaches[0], reach) for reach in reaches
+            ]
+            relative_lead_row = "  lead %   " + "".join(
+                f" | {('n/a' if lead is None else f'{lead:.6g}%'):>14}"
+                for lead in relative_leads
+            )
+            print(relative_lead_row + "  (step lead / reference reach)")
 
     if len(runs) < 2:
         return
@@ -1113,23 +1132,28 @@ def write_html(
                 smoothed[run.name], threshold, curve, confirm_points=confirm_points
             )
             if reach is None:
-                cells.append("<td>n/a</td><td>n/a</td><td>n/a</td>")
+                cells.append("<td>n/a</td><td>n/a</td><td>n/a</td><td>n/a</td>")
             else:
                 lead = None if reference_reach is None else reference_reach - reach
+                relative_lead = relative_step_lead(reference_reach, reach)
                 consumed = interpolate_consumed_samples(run.records, reach)
                 lead_text = "n/a" if lead is None else f"{lead:+.2f}"
+                relative_lead_text = (
+                    "n/a" if relative_lead is None else f"{relative_lead:+.2f}%"
+                )
                 consumed_text = "n/a" if consumed is None else f"{consumed:.0f}"
                 lead_class = "" if lead is None else (" good" if lead > 0 else " bad" if lead < 0 else "")
                 cells.append(
                     f"<td>{reach:.2f}</td><td>{consumed_text}</td>"
                     f"<td class=\"{lead_class.strip()}\">{lead_text}</td>"
+                    f"<td class=\"{lead_class.strip()}\">{relative_lead_text}</td>"
                 )
         threshold_rows.append("<tr>" + "".join(cells) + "</tr>")
     threshold_header = "".join(
-        f'<th colspan="3">{html.escape(run.name)}</th>' for run in runs
+        f'<th colspan="4">{html.escape(run.name)}</th>' for run in runs
     )
     threshold_subheader = "".join(
-        "<th>iteration</th><th>consumed samples</th><th>step lead</th>"
+        "<th>iteration</th><th>consumed samples</th><th>step lead</th><th>lead %</th>"
         for _ in runs
     )
 
@@ -1422,6 +1446,8 @@ svg {{ width: 100%; height: auto; }}
 .tick {{ font-size: 12px; fill: #4b5563; }}
 .axis-label {{ font-size: 14px; fill: #1f2937; font-weight: 600; }}
 table {{ border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }}
+.table-scroll {{ max-width: 100%; overflow-x: auto; overscroll-behavior-inline: contain; -webkit-overflow-scrolling: touch; }}
+.table-scroll table {{ width: max-content; min-width: 100%; }}
 th, td {{ border: 1px solid #d1d5db; padding: 7px 9px; text-align: right; }}
 th {{ background: #f3f4f6; }}
 td:first-child, th:first-child {{ text-align: left; }}
@@ -1438,9 +1464,9 @@ code {{ background: #f3f4f6; padding: 1px 4px; border-radius: 4px; }}
 Comparison curve: <code>{html.escape(curve)}</code>; EMA half-life: {ema_halflife:g}; trailing window: {rolling_window}; centered window: {centered_window or 'disabled'}; threshold confirmation: {confirm_points} consecutive points; raw traces: {'shown at low opacity' if show_raw else 'hidden'}.</p>
 <section class="card"><h2>Loss versus optimizer iteration</h2><div class="legend">{legend}</div>{loss_toolbar}{loss_chart}</section>
 <section class="card"><h2>Iteration at equal smoothed loss</h2><div class="legend">{legend}</div>{threshold_toolbar}{threshold_chart}
-<table><thead><tr><th rowspan="2">loss threshold</th>{threshold_header}</tr><tr>{threshold_subheader}</tr></thead>
-<tbody>{''.join(threshold_rows) if threshold_rows else '<tr><td colspan="99">No shared threshold available.</td></tr>'}</tbody></table>
-<p class="meta">A threshold is accepted only after {confirm_points} consecutive {html.escape(curve)} points remain at or below it. Reaching iteration and consumed samples are linearly interpolated across the accepted descending crossing. Step lead is not sample efficiency when global batch sizes differ; see warnings below.</p></section>
+<div class="table-scroll" role="region" aria-label="Equal-loss threshold comparison" tabindex="0"><table><thead><tr><th rowspan="2">loss threshold</th>{threshold_header}</tr><tr>{threshold_subheader}</tr></thead>
+<tbody>{''.join(threshold_rows) if threshold_rows else '<tr><td colspan="99">No shared threshold available.</td></tr>'}</tbody></table></div>
+<p class="meta">A threshold is accepted only after {confirm_points} consecutive {html.escape(curve)} points remain at or below it. Reaching iteration and consumed samples are linearly interpolated across the accepted descending crossing. Lead % is step lead divided by the reference reach iteration; positive values mean earlier than the reference. Step lead is not sample efficiency when global batch sizes differ; see warnings below.</p></section>
 <section class="card"><h2>Consistency warnings</h2>{warnings_html}</section>
 </main>{interaction_script}</body></html>
 """

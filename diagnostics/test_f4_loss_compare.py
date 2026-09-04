@@ -18,6 +18,7 @@ from diagnostics.f4_loss_compare import (
     load_run,
     main,
     parse_line,
+    relative_step_lead,
     smooth_loss,
     write_html,
 )
@@ -149,6 +150,7 @@ class ParseTests(unittest.TestCase):
             self.assertTrue(csv_path.is_file())
             self.assertTrue(html_path.is_file())
             self.assertIn("F2 - F1", stdout.getvalue())
+            self.assertIn("lead %", stdout.getvalue())
             self.assertIn("consumed samples", html_path.read_text(encoding="utf-8"))
 
 
@@ -174,6 +176,12 @@ class SmoothingTests(unittest.TestCase):
     def test_consumed_samples_interpolation(self) -> None:
         records = make_records([5.0, 4.0, 3.0])
         self.assertAlmostEqual(interpolate_consumed_samples(records, 1.5) or 0.0, 1.5)
+
+    def test_relative_step_lead_uses_reference_reach(self) -> None:
+        self.assertAlmostEqual(relative_step_lead(100.0, 80.0) or 0.0, 20.0)
+        self.assertAlmostEqual(relative_step_lead(100.0, 120.0) or 0.0, -20.0)
+        self.assertIsNone(relative_step_lead(0.0, 0.0))
+        self.assertIsNone(relative_step_lead(None, 80.0))
 
     def test_multi_run_auto_thresholds_and_html(self) -> None:
         run_a_records = make_records([5.0, 4.5, 4.0, 3.5])
@@ -204,6 +212,10 @@ class SmoothingTests(unittest.TestCase):
         self.assertIn("<svg", rendered)
         self.assertIn("consumed samples", rendered)
         self.assertIn("step lead", rendered)
+        self.assertIn("<th>lead %</th>", rendered)
+        self.assertIn('class="table-scroll"', rendered)
+        self.assertIn("overflow-x: auto", rendered)
+        self.assertIn("step lead divided by the reference reach iteration", rendered)
         self.assertIn('id="loss-chart"', rendered)
         self.assertIn('id="threshold-chart"', rendered)
         self.assertIn(
