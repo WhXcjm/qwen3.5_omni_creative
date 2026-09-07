@@ -159,3 +159,11 @@ mindspeed
 /diagnostics/_generated/
 
 fusion_result.json
+
+# hf_models: keep only config.json per model dir (tokenizer/vocab/processor 等不上传)
+hf_models/*/*
+!hf_models/*/config.json
+
+# model_eval: 只上传 eval_completion.py + run_example.sh；个性化脚本与结果不上传
+model_eval/scripts/
+model_eval/results*/
