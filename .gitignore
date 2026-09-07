@@ -167,3 +167,8 @@ hf_models/*/*
 # model_eval: 只上传 eval_completion.py + run_example.sh；个性化脚本与结果不上传
 model_eval/scripts/
 model_eval/results*/
+model_eval/data
+model_eval/mmlu_runs
+
+model_eval/mmlu*.json
+!model_eval/mmlu_groups.template.json

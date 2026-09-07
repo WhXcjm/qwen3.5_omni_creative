@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "output_root": "",
+  "evaluation": {
+    "data": "",
+    "device": "npu",
+    "seed": 0,
+    "max_length": 4096
+  },
+  "notes": [
+    "Fill absolute server paths; config is the model asset directory with config.json, not a training YAML. All groups are enabled; disable only intentional exclusions.",
+    "Verify actual checkpoint step and experiment identity from server records. T2 is distinct from T6. All seven Muon groups use whole-matrix Muon for in_proj_a/b.",
+    "T4 may reuse verified equivalent old hg0. longTest_05-new_dyn_lr4e-4_hg0 is T5 (a/b AdamW), not T4. Verify T7/T9 checkpoint existence on server."
+  ],
+  "groups": [
+    {
+      "enabled": true,
+      "group_id": "adamw_lr4e4",
+      "description": "AdamW baseline, lr=4e-4, target iter5000",
+      "expected_step": 5000,
+      "checkpoint": "",
+      "config": "",
+      "tokenizer": ""
+    },
+    {
+      "enabled": true,
+      "group_id": "t2_old_dynamic_lr4e4",
+      "description": "T2 old mixed head layout, Dynamic RMS, lr=4e-4 (distinct from strict T6)",
+      "expected_step": 5000,
+      "checkpoint": "",
+      "config": "",
+      "tokenizer": ""
+    },
+    {
+      "enabled": true,
+      "group_id": "t3_old_dynamic_lr2e3",
+      "description": "T3 old mixed head layout, Dynamic RMS, lr=2e-3",
+      "expected_step": 5000,
+      "checkpoint": "",
+      "config": "",
+      "tokenizer": ""
+    },
+    {
+      "enabled": true,
+      "group_id": "fix_rms_old_lr4e4",
+      "description": "Fix-RMS old layout, lr=4e-4, matched_adamw_rms=0.231312, Dynamic=false",
+      "expected_step": 5000,
+      "checkpoint": "",
+      "config": "",
+      "tokenizer": ""
+    },
+    {
+      "enabled": true,
+      "group_id": "t4_strict_hg0",
+      "description": "T4 strict comparison hg=0 All-head, Dynamic RMS, lr=4e-4; verified equivalent old hg0 allowed; never T5",
+      "expected_step": 5000,
+      "checkpoint": "",
+      "config": "",
+      "tokenizer": ""
+    },
+    {
+      "enabled": true,
+      "group_id": "t6_strict_hg1",
+      "description": "T6 strict Per-head hg=1, Dynamic RMS, lr=4e-4 (not old T2)",
+      "expected_step": 5000,
+      "checkpoint": "",
+      "config": "",
+      "tokenizer": ""
+    },
+    {
+      "enabled": true,
+      "group_id": "t7_strict_hg2",
+      "description": "T7 strict Grouped-head hg=2, Dynamic RMS, lr=4e-4; verify iter5000 exists",
+      "expected_step": 5000,
+      "checkpoint": "",
+      "config": "",
+      "tokenizer": ""
+    },
+    {
+      "enabled": true,
+      "group_id": "t9_strict_hg4",
+      "description": "T9 strict Grouped-head hg=4, Dynamic RMS, lr=4e-4; verify iter5000 exists",
+      "expected_step": 5000,
+      "checkpoint": "",
+      "config": "",
+      "tokenizer": ""
+    }
+  ]
+}
