@@ -81,6 +81,8 @@ def run(args):
     started = time.time()
     records, expected = [], {}
     mode = "smoke" if args.smoke else "full"
+    shard = getattr(args, "shard", None)
+    num_shards = getattr(args, "num_shards", 1)
     meta = {"group_id": args.group_id, "expected_step": args.expected_step,
             "protocol": protocol(args.seed, args.max_length, mode), "device": args.device,
             "formal_score": False, "status": "running"}
@@ -94,6 +96,14 @@ def run(args):
         selected = ("abstract_algebra", "anatomy") if args.smoke else SUBJECTS
         rows = {s: data["subjects"][s]["test"][:2] if args.smoke else data["subjects"][s]["test"]
                 for s in selected}
+        if shard is not None and num_shards > 1:
+            # Deterministic round-robin over the subject-major ordering: each shard scores
+            # every num_shards-th question and writes only its own slice.
+            kept = {}
+            for i, (s, r) in enumerate((s, r) for s in selected for r in rows[s]):
+                if i % num_shards == shard:
+                    kept.setdefault(s, []).append(r)
+            rows = kept
         expected = {s: len(r) for s, r in rows.items()}
         identity = checkpoint_identity(paths["checkpoint"])
         meta.update({"paths": paths, "description": args.description, "checkpoint_identity": identity,
@@ -103,7 +113,7 @@ def run(args):
                      "tokenizer_assets": asset_hashes(paths["tokenizer"]),
                      "code_sha256": {p.name: file_hash(p) for p in Path(__file__).parent.glob("*.py")},
                      "fewshot_ids": {s: [d["id"] for d in data["subjects"][s]["dev"]] for s in selected},
-                     "selected_test_ids": {s: [r["id"] for r in rows[s]] for s in selected}})
+                     "selected_test_ids": {s: [r["id"] for r in rows[s]] for s in rows}})
         meta["protocol_sha256"] = digest({"protocol": meta["protocol"], "data": data["content_sha256"],
                                            "config": meta["config_assets"], "tokenizer": meta["tokenizer_assets"]})
         write_json(out / "run.json", meta)
@@ -116,7 +126,7 @@ def run(args):
         write_json(out / "run.json", meta)
         forward = torch_forward(model, args.device)
         with (out / "questions.jsonl").open("x", encoding="utf-8") as stream:
-            for subject in selected:
+            for subject in rows:
                 for row in rows[subject]:
                     context = make_context(subject, data["subjects"][subject]["dev"], row)
                     result = {"id": row["id"], "subject": subject, "answer": LABELS[row["answer"]],
@@ -143,6 +153,8 @@ def run(args):
                 or file_hash(data_path) != meta["data_file_sha256"]):
             raise RuntimeError("Checkpoint/assets/data changed during evaluation; score invalid")
         summary = aggregate(records, expected, mode)
+        if shard is not None and not records:
+            summary["complete"] = True  # Empty shard slice: vacuous completion, no formal score.
         status = "smoke_complete" if args.smoke and summary["complete"] else (
             "complete" if summary["complete"] else "incomplete")
     except Exception as error:
@@ -173,9 +185,16 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-length", type=int, default=4096)
     p.add_argument("--smoke", action="store_true", help="Fixed 4 questions, never a formal score")
+    p.add_argument("--shard", type=int, default=None, help="0-based shard index (round-robin over questions)")
+    p.add_argument("--num-shards", type=int, default=1,
+                   help="Total shards; a shard scores every num-shards-th question")
     args = p.parse_args()
     if args.max_length < 1:
         p.error("--max-length must be positive")
+    if (args.shard is None) != (args.num_shards == 1):
+        p.error("--shard and --num-shards must be provided together (or use defaults)")
+    if args.shard is not None and not (0 <= args.shard < args.num_shards):
+        p.error("--shard must satisfy 0 <= shard < num-shards")
     return run(args)
 
 
