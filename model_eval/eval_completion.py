@@ -142,7 +142,8 @@ def repo_root_of_this_file() -> str:
 # ---------------------------------------------------------------------------
 # Model build
 # ---------------------------------------------------------------------------
-def build_model(config_dir: str, attn: str, dtype_str: str, device: str = "cpu"):
+def build_model(config_dir: str, attn: str, dtype_str: str, device: str = "cpu",
+                use_triton_gdn: bool = False, use_grouped_expert_matmul: bool = False):
     from transformers import AutoConfig
     from accelerate import init_empty_weights
     from mindspeed_mm.fsdp.models.qwen3_5_moe.modeling_qwen3_5_moe import (
@@ -153,12 +154,15 @@ def build_model(config_dir: str, attn: str, dtype_str: str, device: str = "cpu")
 
     tc = config.text_config
     tc._attn_implementation = attn
-    # torch fallbacks (correct for eval): fused triton-GDN chunk rule diverges on
-    # short prefill sequences and is skipped; grouped-expert matmul can be enabled
-    # separately if the torch expert loop is the bottleneck.
-    tc.use_triton_gdn = False
+    # Default torch fallbacks (correct for decode/completion eval): the fused
+    # triton-GDN chunk rule diverges on short (seq_len==1) prefill and is skipped.
+    # PPL eval does a full-length (4096) prefill forward, the same as training, so it
+    # may enable the Triton GDN + grouped-expert kernels (via the --fast flag) to match
+    # training speed. causal_conv1d/fla are not installed here; the conv step falls back
+    # to torch conv1d, which is minor relative to the chunked-GDN core.
+    tc.use_triton_gdn = use_triton_gdn
     tc.use_ascend_gdn = False
-    tc.use_grouped_expert_matmul = False
+    tc.use_grouped_expert_matmul = use_grouped_expert_matmul
     tc.use_cache = True
     # Skip MTP + aux-loss machinery for eval (weights are not loaded).
     tc.mtp_num_layers = 0

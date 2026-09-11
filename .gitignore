@@ -172,3 +172,8 @@ model_eval/mmlu_runs
 
 model_eval/mmlu*.json
 !model_eval/mmlu_groups.template.json
+
+model_eval/ppl_runs*
+
+model_eval/ppl*.json
+!model_eval/ppl_groups.template.json

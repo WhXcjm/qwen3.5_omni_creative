@@ -44,7 +44,7 @@ def checkpoint_identity(root):
                        for p in sorted(root.glob("*.distcp"))]}
 
 
-def load_model(paths, device, seed):
+def load_model(paths, device, seed, use_triton_gdn=False, use_grouped_expert_matmul=False):
     # Enforce offline HF calls before importing any HF/model modules. Paths were verified local.
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -61,7 +61,9 @@ def load_model(paths, device, seed):
     _setup_single_process_dist(device)
     tokenizer = AutoTokenizer.from_pretrained(paths["tokenizer"], trust_remote_code=True,
                                               local_files_only=True)
-    model, _ = build_model(paths["config"], "eager", "bfloat16", device)
+    model, _ = build_model(paths["config"], "eager", "bfloat16", device,
+                           use_triton_gdn=use_triton_gdn,
+                           use_grouped_expert_matmul=use_grouped_expert_matmul)
     weights = load_text_weights(paths["checkpoint"])
     report = load_into_model(model, weights, "bfloat16", device)
     del weights
